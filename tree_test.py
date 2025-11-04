@@ -322,6 +322,8 @@ def extract_md_headings_with_range(file_path: str) -> List[Dict]:
 
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
+        cleaned_lines = [line.rstrip() for line in lines if line.strip()]
+        lines = cleaned_lines
 
     char_offset = 0
     for i, line in enumerate(lines):
@@ -351,11 +353,12 @@ def extract_md_headings_with_range(file_path: str) -> List[Dict]:
     return headings
 
 if __name__ == "__main__":
-    md_path = r"D:\PycharmProjects\robot\raw_data\富家汇常见问题.md"
+    md_path = r"D:\PycharmProjects\robot\raw_data\联络中心办事指南及常见问题百问百答.md"
     result = extract_md_headings_with_range(md_path)
 
     # 打印结果
     for h in result:
+        # print(f"{h['title']}")
         print(f"L{h['level']} | {h['title']} | [{h['start_index']}, {h['end_index']})")
 
     # 获取第一个标题下的全部原文内容
