@@ -140,11 +140,22 @@ if __name__ == "__main__":
 
     async def main():
 
-
-        system = IoCContainer.get_instance().resolve("PromptManager").get("plan")
+        text ='''
+step_1:
+    sub_task: "确认《西游记》中唐僧的三个徒弟分别是谁",
+    answer: "孙悟空，猪八戒,达摩"
+step_2:
+    sub_task: "确定三个徒弟的排序：大徒弟、二徒弟",
+    answer: ""  
+step_3:
+    sub_task: "根据排序找出唐僧的二徒弟是谁",
+    answer: ""
+判断step_1中answer是否可以从逻辑上回复sub_task。
+        '''
+        system = IoCContainer.get_instance().resolve("PromptManager").get("replan")
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": " 组件板上为什么有色差？"}]
+            {"role": "user", "content": text}]
         response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages,stream=False)
         print(extract_json_brace_block(response.choices[0].message.content))
 
