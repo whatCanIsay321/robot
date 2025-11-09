@@ -16,7 +16,7 @@ class OpenAIClient:
     async def call_async(
         self,
         messages: List[Dict[str, str]],
-        temperature: float = 0.0,
+        temperature: float = 1.0,
         **kwargs
     ) -> str:
         """

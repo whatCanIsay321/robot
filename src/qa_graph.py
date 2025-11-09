@@ -3,41 +3,121 @@ from langgraph.graph import StateGraph
 from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from typing import TypedDict, Any
+from pydantic import BaseModel
 from ioc import IoCContainer
 from prompt_manager import PromptManager
 from llm_client import  OpenAIClient
+from loguru import logger
 from embedding_client import OpenAIEmbeddingClient
 import asyncio
 import json
 import time
+class QaState(BaseModel):
+    target: str
+    node: Any
+    plan:Any
+    function_name: str
+    function_args: Any
+    result:Any
+    error:Any
 
 
-def extract_json_brace_block(text):
+import json
+import re
+from typing import Any
+
+
+def parse_json_or_array(text: str) -> Any:
     """
-    从文本中提取第一个 `{` 到最后一个 `}` 之间的内容（包含括号）。
-    适用于提取包裹在大括号中的 JSON 块，允许中间嵌套内容。
+    从字符串中提取并解析 JSON 对象或数组。
+    - 自动识别是单个对象还是数组
+    - 自动修剪多余文本
+    - 自动跳过前后杂质字符
+    - 若解析失败则返回 None
 
-    参数:
-        text (str): 输入的原始字符串
-    返回:
-        str | None: 匹配的 JSON 字符串（含大括号），失败则返回 None
+    示例：
+        parse_json_or_array('{"a":1}')           -> {'a': 1}
+        parse_json_or_array('[{"a":1},{"b":2}]') -> [{'a':1}, {'b':2}]
+        parse_json_or_array('前缀 [{"x":2}] 后缀') -> [{'x':2}]
     """
-    start = text.find('{')
-    end = text.rfind('}')
-    if start != -1 and end != -1 and start < end:
-        return text[start:end + 1]
-    return None
+
+    # 1️⃣ 提取第一个 JSON 对象或数组（最外层匹配）
+    pattern = r'(\{.*\}|\[.*\])'
+    match = re.search(pattern, text.strip(), re.DOTALL)
+    if not match:
+        return None
+
+    json_str = match.group(1)
+
+    # 2️⃣ 尝试解析
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        # 尝试修复常见格式错误
+        fixed = (
+            json_str
+            .replace("'", '"')       # 单引号→双引号
+            .replace("None", "null") # Python None → JSON null
+            .replace("True", "true")
+            .replace("False", "false")
+            .strip()
+        )
+        try:
+            return json.loads(fixed)
+        except Exception:
+            return None
+
+
+async def plan(self, state: QaState) -> Command:
+    """LangGraph 标准入口"""
+    try:
+        logger.info(f"➡️ Running node: plan")
+        system = IoCContainer.get_instance().resolve("PromptManager").get("plan")
+        target = state.target
+        messages = [{"role":"system","content":system},{"role": "user", "content": f"{target}"}]
+        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=False)
+        content = response.choices[0].content
+        arguments = json.loads(arguments)
+
+        update = await self.run(state)
+        goto = update.pop("goto", self.next_step)
+        logger.info(f"✅ Node {self.name} completed, next: {goto}")
+        return Command(update=update, goto=goto)
+    except Exception as e:
+        logger.exception(f"❌ Error in node {self.name}: {e}")
+        return Command(update={"error": str(e)}, goto="agent_finish")
+
+async def augment(self, state: QaState) -> Command:
+    """LangGraph 标准入口"""
+    try:
+        logger.info(f"➡️ Running node: augment")
+        system = IoCContainer.get_instance().resolve("PromptManager").get("augment")
+
+
+        target = state.target
+        plan = state.plan
+        prompt = f'''
+        target:{target}
+        
+        '''
+
+
+        messages = [{"role":"system","content":system},{"role": "user", "content":"" }]
+        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=False)
+        content = response.choices[0].content
+        arguments = json.loads(arguments)
+
+        update = await self.run(state)
+        goto = update.pop("goto", self.next_step)
+        logger.info(f"✅ Node {self.name} completed, next: {goto}")
+        return Command(update=update, goto=goto)
+    except Exception as e:
+        logger.exception(f"❌ Error in node {self.name}: {e}")
+        return Command(update={"error": str(e)}, goto="agent_finish")
 
 
 #
-# class QaState(TypedDict):
-#     user_input: str
-#     node: Any
-#     plan:Any
-#     function_name: str
-#     function_args: Any
-#     result:Any
-#     error:Any
+
 #
 #
 #
@@ -128,7 +208,7 @@ if __name__ == "__main__":
         key="PromptManager",
         cls=PromptManager,
         singleton=True,
-        constructor_kwargs={"prompt_dir": r"D:\PycharmProjects\robot\prompts"}
+        constructor_kwargs={"prompt_dir": r"E:\robot\prompts"}
     )
 
     container.initialize_all_singletons()
@@ -143,21 +223,45 @@ if __name__ == "__main__":
         text ='''
 step_1:
     sub_task: "确认《西游记》中唐僧的三个徒弟分别是谁",
-    answer: "孙悟空，猪八戒,达摩"
+    answer: "孙悟空，猪八戒"
 step_2:
     sub_task: "确定三个徒弟的排序：大徒弟、二徒弟",
     answer: ""  
 step_3:
     sub_task: "根据排序找出唐僧的二徒弟是谁",
     answer: ""
-判断step_1中answer是否可以从逻辑上回复sub_task。
+判断step_2中answer是否可以从逻辑上回复sub_task。
         '''
-        system = IoCContainer.get_instance().resolve("PromptManager").get("replan")
+        text_au ='''
+target: "西游记中唐僧的二徒弟是谁"
+Plan progress: 
+    step_1:
+        task: "确认《西游记》中唐僧的三个徒弟分别是谁",
+        answer: "孙悟空，猪八戒，沙和尚"
+    step_2:
+        task: "确定三个徒弟的排序：大徒弟、二徒弟",
+        answer: ""  
+    step_3:
+        task: "根据排序找出唐僧的二徒弟是谁",
+        answer: ""
+Existing knowledge: “”
+Current task: 确定三个徒弟的排序：大徒弟、二徒弟
+'''
+
+
+        system = IoCContainer.get_instance().resolve("PromptManager").get("augment")
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": text}]
-        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages,stream=False)
-        print(extract_json_brace_block(response.choices[0].message.content))
+            {"role": "user", "content": text_au}]
+        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(
+            messages=messages,
+            stream=False,
+            # response_format={'type': 'json_object'}
+        )
+        # print(response.choices[0].content)
+        print(parse_json_or_array(response.choices[0].message.content))
+
+        # print(extract_json_brace_block(response.choices[0].message.content))
 
         # while True:
         #     user_input = input("请输入内容：").strip()
