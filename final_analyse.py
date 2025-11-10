@@ -176,7 +176,7 @@ Output example:
 
 if __name__ == "__main__":
     model_path = r"./utils/tokenizer"
-    cleaned_path = r"./raw_data/ii.md"
+    cleaned_path = r"./raw_data/联络中心办事指南及常见问题百问百答_cleaned.md"
 
     tool = MarkdownTokenizerTool(model_path)
     chunks = tool.chunk_until_token_limit(cleaned_path, max_tokens=2046)
@@ -185,7 +185,7 @@ if __name__ == "__main__":
     for idx, chunk in enumerate(chunks, 1):
         print(f"\n=== 🧩 正在分析第 {idx}/{len(chunks)} 块 ===")
         result = analyze_md_tree_with_deepseek(result, chunk)
-        with open(f"sanguo{idx}.md", "w", encoding="utf-8") as f:
+        with open(f"clean{idx}.md", "w", encoding="utf-8") as f:
             f.write(result)
         # # Step 3️⃣: 保存中间结果
         # with open(f"gg_merged_progress_{idx}.md", "a", encoding="utf-8") as f:

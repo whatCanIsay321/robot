@@ -1,32 +1,20 @@
+from gradio.themes.builder_app import history
 from langgraph.constants import START,END
 from langgraph.graph import StateGraph
 from langgraph.config import get_stream_writer
 from langgraph.types import Command
-from typing import TypedDict, Any
 from pydantic import BaseModel
 from ioc import IoCContainer
 from prompt_manager import PromptManager
+from milvus_retrieval import MilvusHybridRetriever
 from llm_client import  OpenAIClient
 from loguru import logger
 from embedding_client import OpenAIEmbeddingClient
 import asyncio
 import json
 import time
-class QaState(BaseModel):
-    target: str
-    node: Any
-    plan:Any
-    function_name: str
-    function_args: Any
-    result:Any
-    error:Any
-
-
-import json
 import re
-from typing import Any
-
-
+from typing import Any,Dict
 def parse_json_or_array(text: str) -> Any:
     """
     从字符串中提取并解析 JSON 对象或数组。
@@ -67,133 +55,136 @@ def parse_json_or_array(text: str) -> Any:
         except Exception:
             return None
 
+class QaState(BaseModel):
+    target: str
+    plan:Dict
+    current_step:int
+    Knowledge:str
+    augment:Any
+    chunks:list
+    error:Any
 
-async def plan(self, state: QaState) -> Command:
-    """LangGraph 标准入口"""
-    try:
-        logger.info(f"➡️ Running node: plan")
-        system = IoCContainer.get_instance().resolve("PromptManager").get("plan")
+class Qa_plan:
+    async def __call__(self, state: QaState):
+        system = IoCContainer.get_instance().resolve("PromptManager").get("plan_rag")
         target = state.target
-        messages = [{"role":"system","content":system},{"role": "user", "content": f"{target}"}]
-        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=False)
-        content = response.choices[0].content
-        arguments = json.loads(arguments)
+        messages = [
+            {"role":"system","content":system},
+            {"role": "user", "content": target}
+        ]
+        try:
+            writer = get_stream_writer()
+            response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages,stream=True)
+            content = ""
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content += chunk.choices[0].delta.content
+                    writer(chunk.choices[0].delta.content)
+            plan = parse_json_or_array(content)
+            return Command(update={"plan": plan,"current_step":1},goto="Qa_augment")
+        except Exception as e:
+            exception = str(e)
+            return Command(update={"error": f"{exception}"})
 
-        update = await self.run(state)
-        goto = update.pop("goto", self.next_step)
-        logger.info(f"✅ Node {self.name} completed, next: {goto}")
-        return Command(update=update, goto=goto)
-    except Exception as e:
-        logger.exception(f"❌ Error in node {self.name}: {e}")
-        return Command(update={"error": str(e)}, goto="agent_finish")
-
-async def augment(self, state: QaState) -> Command:
-    """LangGraph 标准入口"""
-    try:
-        logger.info(f"➡️ Running node: augment")
+class Qa_augment:
+    async def __call__(self, state: QaState):
         system = IoCContainer.get_instance().resolve("PromptManager").get("augment")
+        prompt = self.build_prompt(state)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            writer = get_stream_writer()
+            # response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=False)
+            response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=True)
+
+            content = ""
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content += chunk.choices[0].delta.content
+                    writer(chunk.choices[0].delta.content)
+            augment = parse_json_or_array(content)
+            return Command(update={"augment": augment},goto="Retrieval")
+        except Exception as e:
+            exception = str(e)
+            return Command(update={"error": f"{exception}"})
+
+    def build_prompt(self, state: QaState) -> str:
+        """
+        构建问答上下文，用于增强阶段。
+        输出格式示例：
+
+        target: 《西游记》中唐僧的二徒弟是谁？
+        Knowledge: 唐僧的徒弟包括孙悟空、猪八戒、沙和尚。
+        progress:
+        step_1:
+            task: "确认唐僧的三个徒弟分别是谁"
+            answer: "孙悟空、猪八戒、沙和尚"
+        step_2:
+            task: "确定三个徒弟的排序"
+            answer: "大徒弟孙悟空，二徒弟猪八戒，三徒弟沙和尚"
+        """
+
+        current_step=state.current_step
+        current_task = ""
+        lines = []
+        lines.append(f"target: {state.target}")
+        lines.append(f"Knowledge: {state.Knowledge or '（暂无知识汇总）'}")
+        lines.append("progress:")
+
+        if isinstance(state.plan, dict):
+            for i, (step_id, step_desc) in enumerate(state.plan.items(), start=1):
+                if i == current_step:
+                    current_task = step_desc
+                lines.append(f"step_{i}:")
+                lines.append(f'  task: "{step_desc}"')
+                answer = state.result or state.Knowledge or "（无回答）"
+                lines.append(f'  answer: "{answer}"')
+        lines.append(f"current_step: {current_step}")
+        lines.append(f'  task: "{current_task}"')
+        return "\n".join(lines)
+
+class Qa_retrieval:
+    async def __call__(self, state: QaState):
+        augment = state.augment
+        response = await IoCContainer.get_instance().resolve("MilvusHybridRetriever").bm25_search(collection_name="documents",query="fdafda")
+    return Command(update={"chunks": chunks},goto="Qa_answer")
+
+class Qa_answer:
+    async def __call__(self, state: QaState):
+        augment = state.augment
+        chunks = []
+
+    return Command(update={"chunks": chunks}, goto="replan")
+
+class Qa_replan:
+    async def __call__(self, state: QaState):
+        augment = state.augment
+        chunks = []
+
+    return Command(update={"chunks": chunks}, goto="replan")
 
 
-        target = state.target
-        plan = state.plan
-        prompt = f'''
-        target:{target}
-        
-        '''
+def build_graph():
+    graph_builder = StateGraph(QaState)
+    Qa_plan_node = Qa_plan()
+    Qa_augment_node =Qa_augment()
+    # Qa_retrieval_node = Qa_retrieval()
+    # Qa_finish_node= Qa_finish()
+    graph_builder.add_node("Qa_plan",Qa_plan_node)
+    graph_builder.add_node("Qa_augment",Qa_augment_node)
+    # graph_builder.add_node("Qa_finish",Qa_finish_node)
+
+    graph_builder.add_edge(START, "Qa_plan")
+    # graph_builder.add_edge("agent_finish", END)
 
 
-        messages = [{"role":"system","content":system},{"role": "user", "content":"" }]
-        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=False)
-        content = response.choices[0].content
-        arguments = json.loads(arguments)
-
-        update = await self.run(state)
-        goto = update.pop("goto", self.next_step)
-        logger.info(f"✅ Node {self.name} completed, next: {goto}")
-        return Command(update=update, goto=goto)
-    except Exception as e:
-        logger.exception(f"❌ Error in node {self.name}: {e}")
-        return Command(update={"error": str(e)}, goto="agent_finish")
-
-
-#
-
-#
-#
-#
-#
-#
-#
-# class Qa_plan:
-#     async def __call__(self, state: QaState):
-#         arguments=""
-#         user_input = state.get("user_input")
-#         messages = [
-#             {"role":"system","content":""},
-#             {"role": "user", "content": f"{user_input}"} ]
-#
-#         try:
-#             writer = get_stream_writer()
-#             response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages,stream=False)
-#             content = response.choices[0].content
-#             arguments = json.loads(arguments)
-#
-#             return Command(update={"plan": arguments},
-#                                goto='agent_execute')
-#         except Exception as e:
-#             exception = str(e)
-#             return Command(update={"error": f"{exception}"}, goto='agent_finish')
-#
-#
-# class Qa_retrieval:
-#     async def __call__(self, state: QaState):
-#         arguments=""
-#         user_input = state.get("user_input")
-#         messages = [
-#             {"role":"system","content":""},
-#             {"role": "user", "content": f"{user_input}"} ]
-#
-#         try:
-#             writer = get_stream_writer()
-#             response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages,stream=False)
-#             content = response.choices[0].content
-#             arguments = json.loads(arguments)
-#
-#             return Command(update={"function_name": function_name, "function_args": arguments},
-#                                goto='agent_execute')
-#         except Exception as e:
-#             exception = str(e)
-#             return Command(update={"error": f"{exception}"}, goto='agent_finish')
-#
-# class Qa_finish:
-#     async def __call__(self, state: QaState):
-#         pass
-#
-# def build_graph():
-#     graph_builder = StateGraph(QaState)
-#     Qa_plan_node = Qa_plan()
-#     Qa_retrieval_node = Qa_retrieval()
-#     Qa_finish_node= Qa_finish()
-#     graph_builder.add_node("Qa_plan",Qa_plan_node)
-#     graph_builder.add_node("Qa_retrieval",Qa_retrieval_node)
-#     graph_builder.add_node("Qa_finish",Qa_finish_node)
-#
-#     graph_builder.add_edge(START, "Qa_plan")
-#     graph_builder.add_edge("agent_finish", END)
-#
-#
-#     graph = graph_builder.compile()
-#     return graph
-
-
-
-
+    graph = graph_builder.compile()
+    return graph
 
 if __name__ == "__main__":
-
-
     container = IoCContainer.get_instance()
-
     container.register_class(
         key="OpenAIClient",
         cls=OpenAIClient,
@@ -208,18 +199,33 @@ if __name__ == "__main__":
         key="PromptManager",
         cls=PromptManager,
         singleton=True,
-        constructor_kwargs={"prompt_dir": r"E:\robot\prompts"}
+        constructor_kwargs={"prompt_dir": r"D:\PycharmProjects\robot\prompts"}
     )
 
+    container.register_class(
+        key="MilvusHybridRetriever",
+        cls=MilvusHybridRetriever,
+        singleton=True,
+        constructor_kwargs={"url": "http://10.60.200.100:19530","token":"root:Milvus"}
+    )
     container.initialize_all_singletons()
-
-
-    #
-    # graph = build_graph()
-    #
-
+    graph = build_graph()
     async def main():
-
+        try:
+            async for chunk in graph.astream({
+                "target": "比较苹果公司和谷歌公司的股票价格谁更高",
+                "plan": {},
+                "current_step": 0,
+                "Knowledge": "",
+                "result": "",
+                "error": "",
+            }, stream_mode="custom"):
+                token_str = chunk
+                print(token_str, end="", flush=True)
+                # for char in token_str:
+                #     print(char,end="",flush=True)
+        except Exception as e:
+            print(f"❌ 出错：{e}")
         text ='''
 step_1:
     sub_task: "确认《西游记》中唐僧的三个徒弟分别是谁",
@@ -237,55 +243,37 @@ target: "西游记中唐僧的二徒弟是谁"
 Plan progress: 
     step_1:
         task: "确认《西游记》中唐僧的三个徒弟分别是谁",
-        answer: "孙悟空，猪八戒，沙和尚"
+        answer: "孙悟空，猪八戒"
     step_2:
         task: "确定三个徒弟的排序：大徒弟、二徒弟",
         answer: ""  
     step_3:
         task: "根据排序找出唐僧的二徒弟是谁",
         answer: ""
-Existing knowledge: “”
+Existing knowledge: ""
 Current task: 确定三个徒弟的排序：大徒弟、二徒弟
 '''
-
-
-        system = IoCContainer.get_instance().resolve("PromptManager").get("augment")
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": text_au}]
-        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(
-            messages=messages,
-            stream=False,
-            # response_format={'type': 'json_object'}
-        )
-        # print(response.choices[0].content)
-        print(parse_json_or_array(response.choices[0].message.content))
+        # system = IoCContainer.get_instance().resolve("PromptManager").get("augment")
+        # messages = [
+        #     {"role": "system", "content": system},
+        #     {"role": "user", "content": text_au}]
+        # response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(
+        #     messages=messages,
+        #     stream=False,
+        #     # response_format={'type': 'json_object'}
+        # )
+        # # print(response.choices[0].content)
+        # print(parse_json_or_array(response.choices[0].message.content))
 
         # print(extract_json_brace_block(response.choices[0].message.content))
-
         # while True:
-        #     user_input = input("请输入内容：").strip()
-        #     if not user_input:
-        #         continue
-        #     print("⏳ 正在处理...")
-        #     start = time.time()
-        #     try:
-        #         async for chunk in graph.astream({
-        #             "user_input": user_input,
-        #             "node": container.resolve("tree"),
-        #             "function_name": "",
-        #             "function_args": "",
-        #             "result": "",
-        #             "error": ""
-        #         },stream_mode="custom"):
-        #             token_str = chunk
-        #             print(token_str, end="", flush=True)
-        #             # for char in token_str:
-        #             #     print(char,end="",flush=True)
+        #     # user_input = input("请输入内容：").strip()
+        #     # if not user_input:
+        #     #     continue
+        #     # print("⏳ 正在处理...")
+        #     # start = time.time()
         #
-        #     except Exception as e:
-        #         print(f"❌ 出错：{e}")
-        #     end = time.time()
-        #     print(f"⏱️ 本轮耗时：{end - start:.2f} 秒")
+        #     # end = time.time()
+        #     # print(f"⏱️ 本轮耗时：{end - start:.2f} 秒")
 
     asyncio.run(main())
