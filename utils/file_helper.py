@@ -137,7 +137,7 @@ if __name__ == "__main__":
     # chunks = tool.chunk_until_token_limit(cleaned_path, max_tokens=2048)
 
     model_path = "./tokenizer"  # 你的 tokenizer 目录
-    file_path = r"D:\PycharmProjects\robot\merged_progress_12.md"
+    file_path = r"D:\PycharmProjects\robot\clean18.md"
 
     tool = MarkdownTokenizerTool(model_path)
 

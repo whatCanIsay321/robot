@@ -59,6 +59,7 @@ class QaState(BaseModel):
     target: str
     plan:Dict
     current_step:int
+    answer:Dict
     Knowledge:str
     augment:Any
     chunks:list
@@ -81,7 +82,8 @@ class Qa_plan:
                     content += chunk.choices[0].delta.content
                     writer(chunk.choices[0].delta.content)
             plan = parse_json_or_array(content)
-            return Command(update={"plan": plan,"current_step":1},goto="Qa_augment")
+            answer = {str(i + 1): "" for i in range(len(plan))}
+            return Command(update={"plan": plan,"answer":answer,"current_step":1},goto="Qa_augment")
         except Exception as e:
             exception = str(e)
             return Command(update={"error": f"{exception}"})
@@ -105,7 +107,7 @@ class Qa_augment:
                     content += chunk.choices[0].delta.content
                     writer(chunk.choices[0].delta.content)
             augment = parse_json_or_array(content)
-            return Command(update={"augment": augment},goto="Retrieval")
+            return Command(update={"augment": augment},goto="Qa_retrieval")
         except Exception as e:
             exception = str(e)
             return Command(update={"error": f"{exception}"})
@@ -139,45 +141,219 @@ class Qa_augment:
                     current_task = step_desc
                 lines.append(f"step_{i}:")
                 lines.append(f'  task: "{step_desc}"')
-                answer = state.result or state.Knowledge or "（无回答）"
+                answer =state.answer.get(str(i)) or "暂未回答"
                 lines.append(f'  answer: "{answer}"')
         lines.append(f"current_step: {current_step}")
         lines.append(f'  task: "{current_task}"')
         return "\n".join(lines)
-
+    
+    
+        
+        
 class Qa_retrieval:
     async def __call__(self, state: QaState):
         augment = state.augment
-        response = await IoCContainer.get_instance().resolve("MilvusHybridRetriever").bm25_search(collection_name="documents",query="fdafda")
-    return Command(update={"chunks": chunks},goto="Qa_answer")
-
+        # response = await IoCContainer.get_instance().resolve("MilvusHybridRetriever").bm25_search(collection_name="documents",query=augment)
+        response = ["苹果的股价是1000","谷歌的股价是9000"]
+        return Command(update={"chunks": response},goto="Qa_answer")
+#
 class Qa_answer:
     async def __call__(self, state: QaState):
-        augment = state.augment
-        chunks = []
+        current_step=state.current_step
+        system = IoCContainer.get_instance().resolve("PromptManager").get("answer")
+        prompt = self.build_prompt(state)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            writer = get_stream_writer()
+            response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=True)
+            content = ""
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content += chunk.choices[0].delta.content
+                    writer(chunk.choices[0].delta.content)
+            result = parse_json_or_array(content)
+            if isinstance(result, dict):
+                answer = result.get("answer", "").strip() or "（未生成回答）"
+                new_knowledge = result.get("new_knowledge", "").strip()
+                is_final_answer = bool(result.get("is_final_answer", False))
+                
+            else:
+                answer = "no answer"
+                new_knowledge = ""
+                is_final_answer = False
+            if is_final_answer:
+                return Command(update={"answer": answer,"Knowledge":state.Knowledge + "\n" + new_knowledge}, goto="Qa_finish")
+            else:
+                updated_answers = state.answer.copy()
+                updated_answers[str(current_step)] = answer
+                current_step=current_step+1
+                updated_knowledge = state.Knowledge + "\n" + new_knowledge if new_knowledge else state.Knowledge
+                return Command(update={"answer": updated_answers,"Knowledge": updated_knowledge,"current_step": current_step}, goto="Qa_replan")
+        except Exception as e:
+            exception = str(e)
+            return Command(update={"error": f"{exception}"})
 
-    return Command(update={"chunks": chunks}, goto="replan")
+    def build_prompt(self, state: QaState) -> str:
+        """
+        构建问答上下文（严格按照以下顺序）：
+        1. Target
+        2. Plan (全局任务规划)
+        3. Progress (已完成步骤及回答)
+        4. Knowledge (知识汇总)
+        5. Retrieved chunks (当前检索到的信息)
+        6. Current step (当前待回答任务)
+        """
 
+        lines = []
+
+        # 1️⃣ Target
+        lines.append(f"Target: {state.target}")
+
+        # 2️⃣ Plan
+        lines.append("Plan:")
+        if isinstance(state.plan, dict) and len(state.plan) > 0:
+            for step_id, step_desc in state.plan.items():
+                lines.append(f'  {step_id}. {step_desc}')
+        else:
+            lines.append("no plan available")
+
+        # 3️⃣ Progress
+        lines.append("Progress:")
+        if hasattr(state, "answer") and isinstance(state.answer, dict) and len(state.answer) > 0:
+            for i, (step_id, step_desc) in enumerate(state.plan.items(), start=1):
+                answer = state.answer.get(str(i)) if state.answer.get(str(i)) != "" else "no answer yet"
+                lines.append(f"  Step_{i}:")
+                lines.append(f'    task: "{step_desc}"')
+                lines.append(f'    answer: "{answer}"')
+        else:
+            lines.append("no progress yet")
+
+        # 4️⃣ Knowledge
+        lines.append(f"Knowledge: {state.Knowledge or 'no knowledge available'}")
+
+        # 5️⃣ Retrieved chunks
+        if hasattr(state, "chunks") and state.chunks:
+            lines.append("Retrieved Chunks From Knowledge Base:")
+            for idx, chunk in enumerate(state.chunks, start=1):
+                lines.append(f"chunk_{idx}: {chunk}.")
+        else:
+            lines.append("Retrieved Chunks:no chunks available")
+
+        # 6️⃣ Current step
+        current_step = state.current_step
+        current_task = ""
+        if isinstance(state.plan, dict) and str(current_step) in state.plan:
+            current_task = state.plan[str(current_step)]
+        lines.append(f"Current Step: {current_step}")
+        lines.append(f'  task: "{current_task}"')
+
+        return "\n".join(lines)
+
+
+#
 class Qa_replan:
     async def __call__(self, state: QaState):
-        augment = state.augment
-        chunks = []
+        current_step=state.current_step
+        system = IoCContainer.get_instance().resolve("PromptManager").get("replan")
+        prompt = self.build_prompt(state)
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            writer = get_stream_writer()
+            response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=True)
+            content = ""
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content += chunk.choices[0].delta.content
+                    writer(chunk.choices[0].delta.content)
+            result = parse_json_or_array(content)
+            replan_required = bool(result.get("replan_required", False))
+            new_plan = result.get("new_plan", {})
+            if replan_required:
+                return Command(update={"plan": new_plan,"current_step":1},goto="Qa_augment")
+            else:
+                return Command(update={},goto="Qa_retrieval")
+     
+        except Exception as e:
+            exception = str(e)
+            return Command(update={"error": f"{exception}"})
 
-    return Command(update={"chunks": chunks}, goto="replan")
+    def build_prompt(self, state: QaState) -> str:
+        """
+        构建验证上下文（严格按照以下顺序）：
+        1. Target
+        2. Plan (全局任务规划)
+        3. Progress (已完成步骤及回答)
+        4. Knowledge (知识汇总)
+        5. The current sub_task and its corresponding answer that need to be validated
+        """
 
+        lines = []
 
+        # 1️⃣ Target
+        lines.append(f"Target: {state.target}")
+
+        # 2️⃣ Plan
+        lines.append("Plan:")
+        if isinstance(state.plan, dict) and len(state.plan) > 0:
+            for step_id, step_desc in state.plan.items():
+                lines.append(f"  {step_id}. {step_desc}")
+        else:
+            lines.append("  no plan available")
+
+        # 3️⃣ Progress
+        lines.append("Progress:")
+        if hasattr(state, "answer") and isinstance(state.answer, dict) and len(state.answer) > 0:
+            for i, (step_id, step_desc) in enumerate(state.plan.items(), start=1):
+                answer = state.answer.get(str(i)) or "no answer yet"
+                lines.append(f"  Step_{i}:")
+                lines.append(f'    task: "{step_desc}"')
+                lines.append(f'    answer: "{answer}"')
+        else:
+            lines.append("  no progress yet")
+
+        # 4️⃣ Knowledge
+        lines.append(f"Knowledge: {state.Knowledge or 'no knowledge available'}")
+
+        # 5️⃣ 当前待验证的 sub_task 和其 answer
+        if hasattr(state, "current_step") and state.current_step is not None:
+            step_id = str(state.current_step-1)
+            sub_task = state.plan.get(step_id, "unknown sub_task")
+            sub_answer = state.answer.get(step_id, "no answer yet")
+            lines.append("\nThe current sub_task and its corresponding answer that need to be validated:")
+            lines.append(f"  Step_{step_id}")
+            lines.append(f'  task: "{sub_task}"')
+            lines.append(f'  answer: "{sub_answer or "no answer yet"}"')
+        else:
+            lines.append("\nThe current sub_task and its corresponding answer that need to be validated: not specified")
+
+        return "\n".join(lines)
+
+class Qa_finish:
+    async def __call__(self, state: QaState):
+      pass
 def build_graph():
     graph_builder = StateGraph(QaState)
     Qa_plan_node = Qa_plan()
     Qa_augment_node =Qa_augment()
-    # Qa_retrieval_node = Qa_retrieval()
-    # Qa_finish_node= Qa_finish()
+    Qa_retrieval_node = Qa_retrieval()
+    Qa_answer_node = Qa_answer()
+    Qa_replan_node = Qa_replan()
+    Qa_finish_node= Qa_finish()
     graph_builder.add_node("Qa_plan",Qa_plan_node)
     graph_builder.add_node("Qa_augment",Qa_augment_node)
-    # graph_builder.add_node("Qa_finish",Qa_finish_node)
+    graph_builder.add_node("Qa_retrieval",Qa_retrieval_node)
+    graph_builder.add_node("Qa_answer",Qa_answer_node)
+    graph_builder.add_node("Qa_replan",Qa_replan_node)  
+    graph_builder.add_node("Qa_finish",Qa_finish_node)
 
     graph_builder.add_edge(START, "Qa_plan")
-    # graph_builder.add_edge("agent_finish", END)
+    graph_builder.add_edge("Qa_finish", END)
 
 
     graph = graph_builder.compile()
@@ -202,23 +378,29 @@ if __name__ == "__main__":
         constructor_kwargs={"prompt_dir": r"D:\PycharmProjects\robot\prompts"}
     )
 
-    container.register_class(
-        key="MilvusHybridRetriever",
-        cls=MilvusHybridRetriever,
-        singleton=True,
-        constructor_kwargs={"url": "http://10.60.200.100:19530","token":"root:Milvus"}
-    )
+    # container.register_class(
+    #     key="MilvusHybridRetriever",
+    #     cls=MilvusHybridRetriever,
+    #     singleton=True,
+    #     constructor_kwargs={"url": "http://10.60.200.100:19530","token":"root:Milvus"}
+    # )
     container.initialize_all_singletons()
     graph = build_graph()
+    # x = graph.get_graph().draw_mermaid_png()
+    # with open("graph.png", "wb") as f:
+    #     f.write(x)  
+    # print("Graph built and saved as graph.png")
     async def main():
         try:
             async for chunk in graph.astream({
                 "target": "比较苹果公司和谷歌公司的股票价格谁更高",
                 "plan": {},
+                "answer": {},
                 "current_step": 0,
                 "Knowledge": "",
-                "result": "",
-                "error": "",
+                "augment": "",
+                "chunks":[],
+                "error": ""
             }, stream_mode="custom"):
                 token_str = chunk
                 print(token_str, end="", flush=True)
