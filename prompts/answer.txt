@@ -40,7 +40,7 @@ You will be given:
   "IfCannotAnswerTarget": {
     "StepAnswer": "If no, provide the current step’s answer here."
   },
-  "ExtractedUsefulInfo": [
+  "ExtractedUsefulInfo":
     "Fact 1 that may be useful later",
     "Fact 2 that may be useful later"
   ]

@@ -1,3 +1,5 @@
+from http.client import responses
+
 from gradio.themes.builder_app import history
 from langgraph.constants import START,END
 from langgraph.graph import StateGraph
@@ -59,10 +61,12 @@ class QaState(BaseModel):
     target: str
     plan:Dict
     current_step:int
+    complete_steps:list
     answer:Dict
     Knowledge:str
     augment:Any
     chunks:list
+    result:Any
     error:Any
 
 class Qa_plan:
@@ -152,15 +156,18 @@ class Qa_augment:
         
 class Qa_retrieval:
     async def __call__(self, state: QaState):
-        augment = state.augment
+        current_step = state.current_step
+        if current_step==1:
         # response = await IoCContainer.get_instance().resolve("MilvusHybridRetriever").bm25_search(collection_name="documents",query=augment)
-        response = ["苹果的股价是1000","谷歌的股价是9000"]
+            response = ["苹果的股价是1000","谷歌的股价是9000"]
+        else:
+            response = []
         return Command(update={"chunks": response},goto="Qa_answer")
 #
 class Qa_answer:
     async def __call__(self, state: QaState):
-        current_step=state.current_step
-        system = IoCContainer.get_instance().resolve("PromptManager").get("answer")
+        current_step = state.current_step
+        system = IoCContainer.get_instance().resolve("PromptManager").get("answer_rag")
         prompt = self.build_prompt(state)
         messages = [
             {"role": "system", "content": system},
@@ -168,30 +175,21 @@ class Qa_answer:
         ]
         try:
             writer = get_stream_writer()
-            response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages, stream=True)
+            response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(messages=messages,
+                                                                                            stream=True)
             content = ""
             async for chunk in response:
                 if chunk.choices[0].delta.content:
                     content += chunk.choices[0].delta.content
                     writer(chunk.choices[0].delta.content)
             result = parse_json_or_array(content)
-            if isinstance(result, dict):
-                answer = result.get("answer", "").strip() or "（未生成回答）"
-                new_knowledge = result.get("new_knowledge", "").strip()
-                is_final_answer = bool(result.get("is_final_answer", False))
-                
-            else:
-                answer = "no answer"
-                new_knowledge = ""
-                is_final_answer = False
-            if is_final_answer:
-                return Command(update={"answer": answer,"Knowledge":state.Knowledge + "\n" + new_knowledge}, goto="Qa_finish")
-            else:
-                updated_answers = state.answer.copy()
-                updated_answers[str(current_step)] = answer
-                current_step=current_step+1
-                updated_knowledge = state.Knowledge + "\n" + new_knowledge if new_knowledge else state.Knowledge
-                return Command(update={"answer": updated_answers,"Knowledge": updated_knowledge,"current_step": current_step}, goto="Qa_replan")
+            CanAnswerTarget = result.get("CanAnswerTarget")
+            if CanAnswerTarget:
+                TargetAnswer = result.get("TargetAnswer")
+                return Command(update={"result": TargetAnswer}, goto="Qa_finish")
+            # else:
+            #     CompletedSteps = sorted([int(x) for x in result.get("CompletedSteps") if str(x).isdigit()])
+            #     if CompletedSteps == current_step:
         except Exception as e:
             exception = str(e)
             return Command(update={"error": f"{exception}"})
@@ -251,7 +249,6 @@ class Qa_answer:
         lines.append(f'  task: "{current_task}"')
 
         return "\n".join(lines)
-
 
 #
 class Qa_replan:
@@ -393,13 +390,15 @@ if __name__ == "__main__":
     async def main():
         try:
             async for chunk in graph.astream({
-                "target": "比较苹果公司和谷歌公司的股票价格谁更高",
+                "target": "帮我看一下今年天合富家的经验情况",
                 "plan": {},
                 "answer": {},
                 "current_step": 0,
+                "complete_steps":[],
                 "Knowledge": "",
                 "augment": "",
                 "chunks":[],
+                "result":"",
                 "error": ""
             }, stream_mode="custom"):
                 token_str = chunk
@@ -408,54 +407,52 @@ if __name__ == "__main__":
                 #     print(char,end="",flush=True)
         except Exception as e:
             print(f"❌ 出错：{e}")
-        text ='''
-step_1:
-    sub_task: "确认《西游记》中唐僧的三个徒弟分别是谁",
-    answer: "孙悟空，猪八戒"
-step_2:
-    sub_task: "确定三个徒弟的排序：大徒弟、二徒弟",
-    answer: ""  
-step_3:
-    sub_task: "根据排序找出唐僧的二徒弟是谁",
-    answer: ""
-判断step_2中answer是否可以从逻辑上回复sub_task。
-        '''
+#         text ='''
+# step_1:
+#     sub_task: "确认《西游记》中唐僧的三个徒弟分别是谁",
+#     answer: "孙悟空，猪八戒"
+# step_2:
+#     sub_task: "确定三个徒弟的排序：大徒弟、二徒弟",
+#     answer: ""
+# step_3:
+#     sub_task: "根据排序找出唐僧的二徒弟是谁",
+#     answer: ""
+# 判断step_2中answer是否可以从逻辑上回复sub_task。
+#         '''
         text_au ='''
 target: "西游记中唐僧的二徒弟是谁"
-Plan progress: 
+Plan progress:
     step_1:
         task: "确认《西游记》中唐僧的三个徒弟分别是谁",
-        answer: "孙悟空，猪八戒"
+        answer: "孙悟空，猪八戒和沙僧"
     step_2:
         task: "确定三个徒弟的排序：大徒弟、二徒弟",
-        answer: ""  
+        answer: "no answer yet"
     step_3:
         task: "根据排序找出唐僧的二徒弟是谁",
-        answer: ""
-Existing knowledge: ""
-Current task: 确定三个徒弟的排序：大徒弟、二徒弟
+        answer: "no answer yet"
 '''
-        # system = IoCContainer.get_instance().resolve("PromptManager").get("augment")
-        # messages = [
-        #     {"role": "system", "content": system},
-        #     {"role": "user", "content": text_au}]
-        # response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(
-        #     messages=messages,
-        #     stream=False,
-        #     # response_format={'type': 'json_object'}
-        # )
-        # # print(response.choices[0].content)
-        # print(parse_json_or_array(response.choices[0].message.content))
-
-        # print(extract_json_brace_block(response.choices[0].message.content))
-        # while True:
-        #     # user_input = input("请输入内容：").strip()
-        #     # if not user_input:
-        #     #     continue
-        #     # print("⏳ 正在处理...")
-        #     # start = time.time()
-        #
-        #     # end = time.time()
-        #     # print(f"⏱️ 本轮耗时：{end - start:.2f} 秒")
+        system = IoCContainer.get_instance().resolve("PromptManager").get("new_replan_logic")
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text_au}]
+        response = await IoCContainer.get_instance().resolve("OpenAIClient").call_async(
+            messages=messages,
+            stream=False,
+            # response_format={'type': 'json_object'}
+        )
+        print(response.choices[0].message.content)
+        print(parse_json_or_array(response.choices[0].message.content))
+#
+#         # print(extract_json_brace_block(response.choices[0].message.content))
+#         # while True:
+#         #     # user_input = input("请输入内容：").strip()
+#         #     # if not user_input:
+#         #     #     continue
+#         #     # print("⏳ 正在处理...")
+#         #     # start = time.time()
+#         #
+#         #     # end = time.time()
+#         #     # print(f"⏱️ 本轮耗时：{end - start:.2f} 秒")
 
     asyncio.run(main())
