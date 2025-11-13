@@ -89,3 +89,62 @@ For each function call, return a json object with function name and arguments wi
     )
 
     return enc
+
+
+from pydantic import BaseModel, Field
+from typing import List, Literal, Any, Optional
+import json
+import copy
+
+
+# 单条消息结构
+class Message(BaseModel):
+    from_: Literal["human", "gpt", "observation"] = Field(alias="from")
+    value: str
+    content: Optional[Any] = None
+
+
+# 单个对话结构（对应原 export 的字典）
+class ConversationItem(BaseModel):
+    system_prompt: str = ""
+    tools: str = ""
+    conversations: List[Message] = Field(default_factory=list)
+
+    def clone(self):
+        return copy.deepcopy(self)
+
+    def add(self, role: Literal["human", "gpt", "observation"], value: Any, content: Any = None):
+        if role == "observation":
+            msg = Message(from_="observation", value=json.dumps(value, ensure_ascii=False), content=content)
+        else:
+            msg = Message(from_=role, value=value, content=content)
+        self.conversations.append(msg)
+
+    def export(self) -> dict:
+        return self.model_dump(by_alias=True)
+
+
+# ✅ 批量维护多个 conversation 的结构
+class ConversationList(BaseModel):
+    items: List[ConversationItem] = Field(default_factory=list)
+
+    def add_conversation(self, conversation: ConversationItem):
+        self.items.append(conversation)
+
+    def export_all(self) -> List[dict]:
+        return [conv.export() for conv in self.items]
+# 创建单个对话
+conv1 = ConversationItem(system_prompt="助手A", tools="[]")
+conv1.add("human", "你好")
+conv1.add("gpt", "你好！")
+
+conv2 = ConversationItem(system_prompt="助手B", tools="[search]")
+conv2.add("human", "帮我查天气")
+conv2.add("observation", {"action": "search", "query": "天气"})
+
+# 创建对话集合
+conv_list = ConversationList()
+conv_list.add_conversation(conv1)
+conv_list.add_conversation(conv2)
+
+print(conv_list.export_all())
